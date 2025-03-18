@@ -18,3 +18,4 @@
 - pandas
 - matplotlib
 - torch
+- docker
