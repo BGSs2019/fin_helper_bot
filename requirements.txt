@@ -1,0 +1,5 @@
+matplotlib==3.10.1
+numpy==2.2.4
+pandas==2.2.3
+pyTelegramBotAPI==4.26.0
+torch==2.5.1
