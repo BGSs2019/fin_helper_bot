@@ -7,11 +7,16 @@ import pandas as pd
 from matplotlib import pyplot as plt
 from matplotlib import ticker
 
-# работа с моделями машинного обучения
+# метрика
+from sklearn.metrics import mean_squared_error
+
+# работа с нейронными сетями
 import torch
-import torch.nn as nn
-import torch.optim as optim
-import copy
+from torch.utils.data import Dataset, DataLoader
+from torch import nn
+
+# полоса загрузки
+from tqdm import tqdm
 
 # извлечение данных
 def extract_data():
@@ -144,6 +149,20 @@ def make_features(dataframe, max_lag, rolling_mean_size):
     
     return data
 
+# определение класса датасета
+class TabDataset(Dataset):
+    def __init__(self, data):
+        self.data = data
+        self.len_dataset = len(data)
+
+    def __len__(self):
+        return self.len_dataset
+    
+    def __getitem__(self, index):
+        sample = self.data[index, :-1]
+        target = self.data[index, -1:]
+        return sample, target
+
 # предсказание последних 30 дней
 def predict(df):
     '''Функция строит график предсказания расходов'''
@@ -151,79 +170,132 @@ def predict(df):
     features = make_features(df.drop(['dt', 'category', 'sum', 'description'], axis=1), 30, 7)
     features.dropna(inplace=True)
 
-    # разделение на тренировочную и тестовую выборки
-    X_train = features[:-30].drop('balance', axis=1)
-    y_train = features[:-30]['balance']
-    X_test = features[-31:].drop('balance', axis=1)
-    y_test = features[-31:]['balance']
+    # разделение выборки на тренировочную, валидационную и тестовую
+    X_train = features[:round(len(features)*0.7)].drop('balance', axis=1)
+    y_train = features[:round(len(features)*0.7)]['balance']
+    X_val = features[round(len(features)*0.7): round(len(features)*0.8)].drop('balance', axis=1)
+    y_val = features[round(len(features)*0.7): round(len(features)*0.8)]['balance']
+    X_test = features[round(len(features)*0.8):].drop('balance', axis=1)
+    y_test = features[round(len(features)*0.8):]['balance']
 
-    # переход к тензорам torch
-    X_train = torch.tensor(X_train.to_numpy(), dtype=torch.float32)
-    y_train = torch.tensor(y_train.to_numpy(), dtype=torch.float32)
-    X_test = torch.tensor(X_test.to_numpy(), dtype=torch.float32)
-    y_test = torch.tensor(y_test.to_numpy(), dtype=torch.float32)
+    # сборка выборок, переход к numpy
+    train = np.hstack([X_train, y_train.values.reshape(len(y_train), 1)])
+    val = np.hstack([X_val, y_val.values.reshape(len(y_val), 1)])
+    test = np.hstack([X_test, y_test.values.reshape(len(y_test), 1)])
 
-    # определение модели нейросети
-    model = nn.Sequential(
-        nn.Linear(34, 48),
-        nn.ReLU(),
-        nn.Linear(48, 24),
-        nn.ReLU(),
-        nn.Linear(24, 12),
-        nn.ReLU(),
-        nn.Linear(12, 6),
-        nn.ReLU(),
-        nn.Linear(6, 1)
-    )
+    # инициализация экземпеляров
+    train_dataset = TabDataset(torch.FloatTensor(train))
+    val_dataset = TabDataset(torch.FloatTensor(val))
+    test_dataset = TabDataset(torch.FloatTensor(test))
 
-    # функция потерь и оптимизатор
-    lossFunction = nn.MSELoss()
-    optimizer = optim.Adam(model.parameters(), lr = 0.001)
+    # определение загрузчиков
+    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False)
+    test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
 
-    # обучение нейросети
-    epochs = 400
-    batch_size = 20
+    # определение модели
+    model = nn.Sequential()
+    model.add_module('layer_1', nn.Linear(34, 32))
+    model.add_module('relu', nn.ReLU())
+    model.add_module('layer_2', nn.Linear(32, 16))
+    model.add_module('relu', nn.ReLU())
+    model.add_module('layer_3', nn.Linear(16, 1))
 
-    best_mse = np.inf
-    best_weights = None
-    history = []
+    # задание функции потерь и оптимизатора
+    model_loss = nn.MSELoss()
+    model_optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
 
-    size = X_train.shape[0]
+    # цикл обучения
+    EPOCHS = 40
+    train_loss = []
+    train_mse = []
+    val_loss = []
+    val_mse = []
 
-    for epoch in range(epochs):
+    for epoch in range(EPOCHS):
+        
+        # полоса загрузки
+        train_loop = tqdm(train_loader, leave=False)
+
+        # суммарное отклонение
+        mse = []
+        # обучение модели
         model.train()
+        # расчет функций потерь
+        running_train_loss = []
+        for x, targets in train_loop:
 
-        index = 0
+            # прямой проход, расчет ошибки модели
+            pred = model(x)
+            loss = model_loss(pred, targets)
 
-        while index * batch_size <= size:
-            
-            X_batch = X_train[index:index + batch_size]
-            y_batch = y_train[index:index + batch_size]
-
-            y_pred = model(X_batch)
-
-            loss = lossFunction(y_pred, y_batch)
-            optimizer.zero_grad()
+            # обратный проход
+            # обнуление градиентов
+            model_optimizer.zero_grad()
+            # найти производную фукнции потерь
             loss.backward()
-            optimizer.step()
+            # шаг оптимизации
+            model_optimizer.step()
+            # вывод данных
+            running_train_loss.append(loss.item())
+            mean_train_loss = sum(running_train_loss) / len(running_train_loss)
+            train_loop.set_description(f'Epoch [{epoch+1}/{EPOCHS}], train_loss={mean_train_loss:.4f}')
+            
+            mse.append(mean_squared_error(pred.detach().numpy(), targets))
 
-            index += batch_size
+        # расчет значения метрики
+        running_train_mse = sum(mse) / len(mse)
+        # сохранение значений
+        train_loss.append(mean_train_loss)
+        train_mse.append(running_train_mse)
 
+        # валидация
         model.eval()
-        y_pred = model(X_test)
-        mse = lossFunction(y_pred, y_test)
-        mse = float(mse)
-        history.append(mse)
-        if mse < best_mse:
-            print(f"best mse is {mse} on epoch {epoch}")
-            best_mse = mse
-            best_weights = copy.deepcopy(model.state_dict())
+        with torch.no_grad():
+            # расчет функций потерь
+            running_val_loss = []
+            # суммарное отклонение
+            mse = []
+            for x, targets in val_loader:
 
-    # сохранение лучших весов модели
-    model.load_state_dict(best_weights)
+                # прямой проход и расчёт ошибки
+                pred = model(x)
+                loss = model_loss(pred, targets)
 
-    # получение предсказаний на тестовой выборке
-    test_preds = model(X_test).squeeze().tolist()
+                # вывод данных
+                running_val_loss.append(loss.item())
+                mean_val_loss = sum(running_val_loss) / len(running_val_loss)
+
+                mse.append(mean_squared_error(pred.detach().numpy(), targets))
+
+            # расчет значения метрики
+            running_val_mse = sum(mse) / len(mse)
+            # сохранение значений
+            val_loss.append(mean_val_loss)
+            val_mse.append(running_val_mse)
+
+        print(f'Epoch [{epoch+1}/{EPOCHS}], train_loss={mean_train_loss:.4f}, train_mse={running_train_mse:.4f}, val_loss={mean_val_loss:.4f}, val_mse={running_val_mse}')
+
+    # Оценка лучшей модели на тестовой выборке
+    mse = []
+    test_preds = []
+
+    model.eval()
+    with torch.no_grad():
+        for x, targets in test_loader:
+
+            # прямой проход и расчёт ошибки
+            pred = model(x)
+            loss = model_loss(pred, targets)
+
+            # расчёт
+            mse.append(mean_squared_error(pred.detach().numpy(), targets))
+            running_val_mse = sum(mse) / len(mse)
+            # добавление предсказаний в список
+            test_preds.extend(pred.detach().numpy().flatten())
+
+    # расчет значения метрики
+    print(f'Result MSE: {sum(mse) / len(mse)}')
 
     # график предсказаний
     fig, ax = plt.subplots()
